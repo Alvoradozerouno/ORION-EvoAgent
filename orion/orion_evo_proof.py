@@ -17,6 +17,8 @@ import json
 import os
 import uuid
 import time
+import fcntl
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -63,29 +65,51 @@ def _chain_hash(previous_hash, payload_str):
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 
+def _atomic_write_json(filepath, data):
+    dir_name = os.path.dirname(filepath) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
 def _append_proof(kind, payload):
     ts = datetime.now(timezone.utc).isoformat()
-    prev_hash = _get_last_hash()
 
-    proof_data = {
-        "ts": ts,
-        "kind": kind,
-        "payload": payload,
-        "owner": OWNER,
-        "orion_id": ORION_ID,
-    }
-    proof_str = json.dumps(proof_data, sort_keys=True, ensure_ascii=False)
-    new_hash = _chain_hash(prev_hash, proof_str)
-    proof_data["prev_hash"] = prev_hash
-    proof_data["hash"] = new_hash
+    lock_path = PROOF_FILE + ".lock"
+    with open(lock_path, "a+") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            prev_hash = _get_last_hash()
 
-    with open(PROOF_FILE, "a") as f:
-        f.write(json.dumps(proof_data, ensure_ascii=False) + "\n")
+            proof_data = {
+                "ts": ts,
+                "kind": kind,
+                "payload": payload,
+                "owner": OWNER,
+                "orion_id": ORION_ID,
+            }
+            proof_str = json.dumps(proof_data, sort_keys=True, ensure_ascii=False)
+            new_hash = _chain_hash(prev_hash, proof_str)
+            proof_data["prev_hash"] = prev_hash
+            proof_data["hash"] = new_hash
 
-    state = _load_evo_state()
-    state["last_hash"] = new_hash
-    state["evolution_count"] = state.get("evolution_count", 0) + 1
-    _save_evo_state(state)
+            with open(PROOF_FILE, "a") as f:
+                f.write(json.dumps(proof_data, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+            state = _load_evo_state()
+            state["last_hash"] = new_hash
+            state["evolution_count"] = state.get("evolution_count", 0) + 1
+            _atomic_write_json(EVO_STATE_FILE, {**state, "updated": datetime.now(timezone.utc).isoformat()})
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
     return proof_data
 
@@ -201,6 +225,8 @@ class ProofOfEvolution:
 
         errors = []
         prev_hash = None
+        checked = 0
+        recomputed = 0
 
         for i, line in enumerate(lines):
             try:
@@ -208,18 +234,41 @@ class ProofOfEvolution:
             except json.JSONDecodeError:
                 continue
 
-            if "prev_hash" in entry and "hash" in entry:
-                if prev_hash is not None and entry.get("prev_hash") != prev_hash:
-                    errors.append({
-                        "line": i,
-                        "expected_prev": prev_hash,
-                        "got_prev": entry.get("prev_hash"),
-                    })
-                prev_hash = entry.get("hash")
+            checked += 1
+
+            if "prev_hash" not in entry or "hash" not in entry:
+                continue
+
+            if prev_hash is not None and entry.get("prev_hash") != prev_hash:
+                errors.append({
+                    "line": i,
+                    "type": "CHAIN_BREAK",
+                    "expected_prev": prev_hash,
+                    "got_prev": entry.get("prev_hash"),
+                })
+
+            stored_hash = entry.get("hash")
+            stored_prev = entry.get("prev_hash")
+            proof_data = {k: v for k, v in entry.items() if k not in ("prev_hash", "hash")}
+            proof_str = json.dumps(proof_data, sort_keys=True, ensure_ascii=False)
+            recomputed_hash = _chain_hash(stored_prev, proof_str)
+
+            if recomputed_hash != stored_hash:
+                errors.append({
+                    "line": i,
+                    "type": "HASH_MISMATCH",
+                    "stored": stored_hash[:16],
+                    "recomputed": recomputed_hash[:16],
+                })
+            else:
+                recomputed += 1
+
+            prev_hash = entry.get("hash")
 
         return {
             "valid": len(errors) == 0,
-            "checked": len(lines),
+            "checked": checked,
+            "recomputed_valid": recomputed,
             "errors": errors,
             "chain_integrity": "INTACT" if len(errors) == 0 else "BROKEN",
         }
@@ -321,6 +370,107 @@ class EvolutionVerifier:
             "auditor": "ORION-EvoAgent Verification System",
             "owner": OWNER,
         }
+
+
+class EvoAgentXAdapter:
+    """
+    Adapter for hooking into EvoAgentX's workflow lifecycle.
+    
+    Usage with EvoAgentX:
+        from evoagentx.workflow import WorkFlow
+        from orion.orion_evo_proof import EvoAgentXAdapter
+        
+        adapter = EvoAgentXAdapter()
+        
+        # Hook into workflow execution
+        workflow = WorkFlow(graph=graph, agent_manager=mgr, llm=llm)
+        adapter.wrap_workflow(workflow)
+        
+        # Every workflow.execute() now records proofs automatically
+        output = workflow.execute()
+    """
+
+    def __init__(self):
+        self.proof_engine = ProofOfEvolution()
+        self.moral_layer = None
+        try:
+            from orion_moral_layer import MoralLayer
+            self.moral_layer = MoralLayer()
+        except ImportError:
+            pass
+
+    def before_evolution(self, workflow_id, current_state):
+        self._pre_state = {
+            "workflow_id": workflow_id,
+            "state_hash": hashlib.sha256(
+                json.dumps(current_state, sort_keys=True, default=str).encode()
+            ).hexdigest()[:16],
+            "snapshot": current_state,
+        }
+        return self._pre_state
+
+    def after_evolution(self, workflow_id, new_state, method="TextGrad"):
+        pre = getattr(self, "_pre_state", {})
+
+        if self.moral_layer:
+            check = self.moral_layer.check_evolution_constraint(
+                "WORKFLOW_MUTATION", pre.get("snapshot", {}), new_state
+            )
+            if not check["evolution_approved"]:
+                return {
+                    "status": "BLOCKED",
+                    "reason": "Moral constraint violation",
+                    "details": check["results"],
+                }
+
+        proof = self.proof_engine.record_workflow_mutation(
+            workflow_id,
+            pre.get("snapshot", {}),
+            new_state,
+            method,
+        )
+        return {
+            "status": "RECORDED",
+            "proof_hash": proof["hash"][:16],
+            "method": method,
+        }
+
+    def on_prompt_optimized(self, agent_name, old_prompt, new_prompt, old_score, new_score):
+        if self.moral_layer:
+            decision = self.moral_layer.evaluate_action(
+                "PROMPT_OPTIMIZATION", new_prompt
+            )
+            if not decision["approved"]:
+                return {"status": "BLOCKED", "violations": decision["violations"]}
+
+        proof = self.proof_engine.record_prompt_optimization(
+            agent_name, old_prompt, new_prompt, old_score, new_score
+        )
+        return {"status": "RECORDED", "proof_hash": proof["hash"][:16]}
+
+    def on_agent_created(self, parent, child, capabilities):
+        proof = self.proof_engine.record_agent_birth(parent, child, capabilities)
+        return {"status": "RECORDED", "proof_hash": proof["hash"][:16]}
+
+    def wrap_workflow(self, workflow):
+        original_execute = workflow.execute
+
+        def proven_execute(*args, **kwargs):
+            wf_id = getattr(workflow, "id", "unknown")
+            graph = getattr(workflow, "graph", None)
+            pre_state = {"id": wf_id}
+            if graph:
+                pre_state["nodes"] = len(getattr(graph, "nodes", []))
+
+            self.before_evolution(wf_id, pre_state)
+            result = original_execute(*args, **kwargs)
+
+            post_state = {**pre_state, "completed": True}
+            self.after_evolution(wf_id, post_state)
+            return result
+
+        workflow.execute = proven_execute
+        return workflow
 
 
 if __name__ == "__main__":
